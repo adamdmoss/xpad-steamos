@@ -80,6 +80,9 @@
 #include <linux/module.h>
 #include <linux/usb/input.h>
 
+#define ADAMdev_err 
+//#define ADAMdev_err dev_err
+
 #define DRIVER_AUTHOR "Marko Friedemann <mfr@bmx-chemnitz.de>"
 #define DRIVER_DESC "X-Box pad driver"
 
@@ -284,6 +287,7 @@ struct usb_xpad {
 	struct usb_interface *intf;	/* usb interface */
 
 	int pad_present;
+        int num_opens;
 
 	struct urb *irq_in;		/* urb for interrupt in report */
 	unsigned char *idata;		/* input data */
@@ -397,6 +401,12 @@ static void xpad360_process_packet(struct usb_xpad *xpad,
 				   u16 cmd, unsigned char *data)
 {
 	struct input_dev *dev = xpad->dev;
+
+	if (!dev)
+	  {
+	    dev_err(&xpad->intf->dev, "WOULD HAVE CRASHED MAYBE: dropping input packet aimed at unbound input device");
+	    return;
+	  }
 
 	/* digital pad */
 	if (xpad->mapping & MAP_DPAD_TO_BUTTONS) {
@@ -539,17 +549,22 @@ static void my_wq_function( struct work_struct *work)
 		
 		input_register_device(xpad->dev);
 		
-		{
+		if(1){
 			struct device* joydev_dev = device_find_child(&xpad->dev->dev, NULL, xpad_find_joydev);
 			
 			if (joydev_dev) {
-// 				printk("found joydev child with minor %i\n", MINOR(joydev_dev->devt));
-				xpad->joydev_id = MINOR(joydev_dev->devt);
-				xpad_send_led_command(xpad, (xpad->joydev_id % 4) + 2);
+			  ADAMdev_err(&xpad->intf->dev, "[2]found joydev child with minor %i\n", MINOR(joydev_dev->devt));
+			  xpad->joydev_id = MINOR(joydev_dev->devt);
+			  xpad_send_led_command(xpad, (xpad->joydev_id % 4) + 2);
 			}
+			else
+			  {
+			    ADAMdev_err(&xpad->intf->dev, "uhh, no joydev child found yet");
+			  }
 		}
-		
+
 		xpad_init_ff(xpad);
+
 	} else {
 		input_unregister_device(xpad->dev);
 	}
@@ -721,6 +736,9 @@ static void xpad_irq_in(struct urb *urb)
 	struct device *dev = &xpad->intf->dev;
 	int retval, status;
 
+	ADAMdev_err(dev, "irq_in: xpad=%x dev=%x xpaddev=%x urb=%x pad_present=%d",
+		    xpad, dev, xpad->dev, urb, xpad->pad_present);
+
 	status = urb->status;
 	
 // 	printk("xpad_irq_in %i\n", status);
@@ -742,6 +760,12 @@ static void xpad_irq_in(struct urb *urb)
 		goto exit;
 	}
 
+	if (!xpad->dev || !urb || !dev)
+	  {
+	    ADAMdev_err(dev, "data intended for unbound device - continuing though");
+	    //return;
+	  }
+
 	switch (xpad->xtype) {
 	case XTYPE_XBOX360:
 		xpad360_process_packet(xpad, 0, xpad->idata);
@@ -757,6 +781,7 @@ static void xpad_irq_in(struct urb *urb)
 	}
 
 exit:
+	ADAMdev_err(dev, "irq_in: submitting urb");
 	retval = usb_submit_urb(urb, GFP_ATOMIC);
 	if (retval)
 		dev_err(dev, "%s - usb_submit_urb failed with result %d\n",
@@ -860,7 +885,7 @@ static int xpad_init_output(struct usb_interface *intf, struct usb_xpad *xpad)
 
 static void xpad_stop_output(struct usb_xpad *xpad)
 {
-	if (xpad->xtype != XTYPE_UNKNOWN)
+	if (xpad->xtype != XTYPE_UNKNOWN && xpad->xtype != XTYPE_XBOX360W)
 		usb_kill_urb(xpad->irq_out);
 }
 
@@ -876,11 +901,14 @@ static void xpad_deinit_output(struct usb_xpad *xpad)
 #ifdef CONFIG_JOYSTICK_XPAD_FF
 static int xpad_play_effect(struct input_dev *dev, void *data, struct ff_effect *effect)
 {
+        int retval = 0;
 	struct usb_xpad *xpad = input_get_drvdata(dev);
 
 	if (effect->type == FF_RUMBLE) {
 		__u16 strong = effect->u.rumble.strong_magnitude;
 		__u16 weak = effect->u.rumble.weak_magnitude;
+
+		spin_lock(&xpad->odata_lock);		
 
 		switch (xpad->xtype) {
 
@@ -893,7 +921,8 @@ static int xpad_play_effect(struct input_dev *dev, void *data, struct ff_effect 
 			xpad->odata[5] = weak / 256;	/* right actuator */
 			xpad->irq_out->transfer_buffer_length = 6;
 
-			return usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+			retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+			break;
 
 		case XTYPE_XBOX360:
 			xpad->odata[0] = 0x00;
@@ -906,7 +935,8 @@ static int xpad_play_effect(struct input_dev *dev, void *data, struct ff_effect 
 			xpad->odata[7] = 0x00;
 			xpad->irq_out->transfer_buffer_length = 8;
 
-			return usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+			retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+			break;
 
 		case XTYPE_XBOX360W:
 			xpad->odata[0] = 0x00;
@@ -923,7 +953,8 @@ static int xpad_play_effect(struct input_dev *dev, void *data, struct ff_effect 
 			xpad->odata[11] = 0x00;
 			xpad->irq_out->transfer_buffer_length = 12;
 
-			return usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+			retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+			break;
 
 		case XTYPE_XBOXONE:
 			xpad->odata[0] = 0x09;
@@ -941,17 +972,21 @@ static int xpad_play_effect(struct input_dev *dev, void *data, struct ff_effect 
 			xpad->odata[12] = 0x00;
 			xpad->irq_out->transfer_buffer_length = 13;
 
-			return usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+			retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+			break;
 
 		default:
 			dev_dbg(&xpad->dev->dev,
 				"%s - rumble command sent to unsupported xpad type: %d\n",
 				__func__, xpad->xtype);
-			return -1;
+			retval = -1;
+			break;
 		}
+
+		spin_unlock(&xpad->odata_lock);
 	}
 
-	return 0;
+	return retval;
 }
 
 static int xpad_init_ff(struct usb_xpad *xpad)
@@ -968,19 +1003,12 @@ static int xpad_init_ff(struct usb_xpad *xpad)
 static int xpad_init_ff(struct usb_xpad *xpad) { return 0; }
 #endif
 
-#if defined(CONFIG_JOYSTICK_XPAD_LEDS)
-#include <linux/leds.h>
-
-struct xpad_led {
-	char name[16];
-	struct led_classdev led_cdev;
-	struct usb_xpad *xpad;
-};
-
 static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 {
 	if ((unsigned)command > 15)
 		return;
+
+	ADAMdev_err(&xpad->intf->dev, "led=%d", command);
 
 	spin_lock(&xpad->odata_lock);
 
@@ -1012,6 +1040,15 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 	usb_submit_urb(xpad->irq_out, GFP_KERNEL);
 	spin_unlock(&xpad->odata_lock);
 }
+
+#if defined(CONFIG_JOYSTICK_XPAD_LEDS)
+#include <linux/leds.h>
+
+struct xpad_led {
+	char name[16];
+	struct led_classdev led_cdev;
+	struct usb_xpad *xpad;
+};
 
 static void xpad_led_set(struct led_classdev *led_cdev,
 			 enum led_brightness value)
@@ -1076,11 +1113,27 @@ static void xpad_led_disconnect(struct usb_xpad *xpad) { }
 static int xpad_open(struct input_dev *dev)
 {
 	struct usb_xpad *xpad = input_get_drvdata(dev);
-// 	printk("xpad open driver data %x\n", (unsigned int)xpad);
+	++xpad->num_opens;
+ 	ADAMdev_err(&xpad->intf->dev, "xpad open driver data %x, now opens=%d\n", (unsigned int)xpad, xpad->num_opens);
 
-	/* URB was submitted in probe */
 	if (xpad->xtype == XTYPE_XBOX360W)
-		return 0;
+	  {
+	    if (0)
+	      {
+		struct device* joydev_dev = device_find_child(&xpad->dev->dev, NULL, xpad_find_joydev);
+		
+		if (joydev_dev) {
+		  ADAMdev_err(&xpad->intf->dev, "found joydev child with minor %i\n", MINOR(joydev_dev->devt));
+		  xpad->joydev_id = MINOR(joydev_dev->devt);
+		  xpad_send_led_command(xpad, (xpad->joydev_id % 4) + 2);
+		}
+	      }
+
+	    /* URB was submitted in probe */
+	    return 0;
+	  }
+
+	ADAMdev_err(&xpad->intf->dev, "bar!");
 
 	xpad->irq_in->dev = xpad->udev;
 	if (usb_submit_urb(xpad->irq_in, GFP_KERNEL))
@@ -1104,6 +1157,9 @@ static int xpad_open(struct input_dev *dev)
 static void xpad_close(struct input_dev *dev)
 {
 	struct usb_xpad *xpad = input_get_drvdata(dev);
+
+ 	ADAMdev_err(&xpad->intf->dev, "xpad close driver data %x, was num opens=%d\n", (unsigned int)xpad, xpad->num_opens);
+	--xpad->num_opens;
 
 	if (xpad->xtype != XTYPE_XBOX360W)
 		usb_kill_urb(xpad->irq_in);
@@ -1183,6 +1239,7 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 		goto fail2;
 	}
 
+	xpad->num_opens = 0;
 	xpad->udev = udev;
 	xpad->intf = intf;
 	xpad->mapping = xpad_device[i].mapping;
@@ -1247,16 +1304,17 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 			goto fail8;
 		}
 
+#if 1
 		xpad->bdata[2] = 0x08;
 		switch (intf->cur_altsetting->desc.bInterfaceNumber) {
 		case 0:
-			xpad->bdata[3] = 0x42;
+		  xpad->bdata[3] = 0x45;//0x42;
 			break;
 		case 2:
-			xpad->bdata[3] = 0x43;
+		  xpad->bdata[3] = 0x45;//0x43;
 			break;
 		case 4:
-			xpad->bdata[3] = 0x44;
+		  xpad->bdata[3] = 0x45;//0x44;
 			break;
 		case 6:
 			xpad->bdata[3] = 0x45;
@@ -1280,12 +1338,17 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 		spin_unlock(&xpad->odata_lock);
 		if (error)
 			goto fail9;
-		
+#else
+		xpad->irq_in->dev = xpad->udev;
+		spin_unlock(&xpad->odata_lock);
+#endif		
+
 		// I don't know how to check controller state on driver load so just slam them
 		// off so that people have to turn them on, triggering a state update
 		
 		// got the power off packet from an OSX reverse-engineered driver:
 		// http://tattiebogle.net/index.php/ProjectRoot/Xbox360Controller/OsxDriver#toc1
+#if 1
 		spin_lock(&xpad->odata_lock);
 		xpad->odata[0] = 0x00;
 		xpad->odata[1] = 0x00;
@@ -1302,6 +1365,9 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 		xpad->irq_out->transfer_buffer_length = 12;
 		usb_submit_urb(xpad->irq_out, GFP_KERNEL);
 		spin_unlock(&xpad->odata_lock);
+
+		xpad->pad_present = 0;
+#endif
 	} else {
 		my_work_t *work;
 		xpad->pad_present = 1;
@@ -1361,7 +1427,7 @@ static void xpad_disconnect(struct usb_interface *intf)
 }
 
 static struct usb_driver xpad_driver = {
-	.name		= "xpad",
+	.name		= "xpad_steamos",
 	.probe		= xpad_probe,
 	.disconnect	= xpad_disconnect,
 	.id_table	= xpad_table,
